@@ -1,0 +1,1097 @@
+--[[
+    DIPLEX HUB - AUTO TRAIT FARM
+    discord.gg/freescript1
+
+    Tracks existing, streamed, renamed and re-enabled purchase prompts.
+    Supports Purchase/Buy text, rich text and split action/object labels.
+    One activation at a time; cancellation on disable, removal and respawn.
+    Client prompt activation is not confirmation of a server purchase.
+    Only client-replicated prompts can be detected.
+]]
+
+--// Services
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+--// Player
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+
+--// Remove an older interface
+local previousGui = playerGui:FindFirstChild("DiplexHubAutoTraitFarm")
+
+if previousGui then
+    previousGui:Destroy()
+end
+
+--// Theme
+local COLORS = {
+    Background = Color3.fromRGB(13, 9, 22),
+    Surface = Color3.fromRGB(25, 17, 41),
+    SurfaceLight = Color3.fromRGB(37, 25, 58),
+
+    Purple = Color3.fromRGB(166, 92, 255),
+    PurpleLight = Color3.fromRGB(202, 151, 255),
+    PurpleDark = Color3.fromRGB(101, 47, 173),
+
+    White = Color3.fromRGB(246, 241, 255),
+    Muted = Color3.fromRGB(170, 158, 190),
+
+    Green = Color3.fromRGB(94, 255, 156),
+    Red = Color3.fromRGB(255, 99, 132)
+}
+
+local FONT = Enum.Font.LuckiestGuy
+
+--// State
+local isAnchored = false
+local autoBuyEnabled = false
+local interfaceClosed = false
+
+--// Auto Buy tuning
+-- Increasing MaxActivationDistance here improves client-side prompt reach.
+-- A server may still enforce its own purchase-distance validation.
+local AUTO_BUY_RANGE = 75
+local SCAN_INTERVAL = 0.12
+local PROMPT_COOLDOWN = 0.75
+local DISTANCE_TOLERANCE = 3
+
+-- Weak-key tables automatically forget destroyed prompts
+local promptCooldowns = setmetatable({}, {
+    __mode = "k"
+})
+
+local trackedPrompts = setmetatable({}, {
+    __mode = "k"
+})
+
+local originalPromptSettings = setmetatable({}, {
+    __mode = "k"
+})
+
+local activePrompt = nil
+local generation = 0
+local anchorOriginal = setmetatable({}, {__mode = "k"})
+local function restoreAnchors()
+    for root, value in pairs(anchorOriginal) do
+        if root.Parent then root.Anchored = value end
+        anchorOriginal[root] = nil
+    end
+end
+local function cancelActivation()
+    generation = generation + 1
+    if activePrompt then
+        pcall(function() activePrompt:InputHoldEnd() end)
+    end
+end
+local restoreAllPrompts
+local connections = {}
+
+--// Utility
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+
+    return connection
+end
+
+local function createCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = parent
+
+    return corner
+end
+
+local function createStroke(parent, color, transparency, thickness)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = color
+    stroke.Transparency = transparency
+    stroke.Thickness = thickness
+    stroke.Parent = parent
+
+    return stroke
+end
+
+local function tween(object, duration, properties)
+    local animation = TweenService:Create(
+        object,
+        TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Quint,
+            Enum.EasingDirection.Out
+        ),
+        properties
+    )
+
+    animation:Play()
+    return animation
+end
+
+local function trim(text)
+    return tostring(text or ""):match("^%s*(.-)%s*$") or ""
+end
+
+--// Screen GUI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DiplexHubAutoTraitFarm"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.DisplayOrder = 50
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+--// Main shadow
+local shadow = Instance.new("Frame")
+shadow.Name = "Shadow"
+shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+shadow.Size = UDim2.fromOffset(384, 354)
+shadow.Position = UDim2.new(0.5, 6, 0.5, 8)
+shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+shadow.BackgroundTransparency = 0.45
+shadow.BorderSizePixel = 0
+shadow.Parent = screenGui
+
+createCorner(shadow, 19)
+
+--// Main frame
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.Size = UDim2.fromOffset(384, 354)
+mainFrame.Position = UDim2.fromScale(0.5, 0.5)
+mainFrame.BackgroundColor3 = COLORS.Background
+mainFrame.BackgroundTransparency = 0.08
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.ClipsDescendants = true
+mainFrame.Parent = screenGui
+
+createCorner(mainFrame, 19)
+
+local mainStroke = createStroke(
+    mainFrame,
+    COLORS.Purple,
+    0.25,
+    1.5
+)
+
+--// Background gradient
+local backgroundGradient = Instance.new("UIGradient")
+backgroundGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(
+        0,
+        Color3.fromRGB(39, 22, 61)
+    ),
+
+    ColorSequenceKeypoint.new(
+        0.5,
+        Color3.fromRGB(20, 13, 34)
+    ),
+
+    ColorSequenceKeypoint.new(
+        1,
+        Color3.fromRGB(12, 8, 21)
+    )
+})
+
+backgroundGradient.Rotation = 125
+backgroundGradient.Parent = mainFrame
+
+--// Purple glow
+local glow = Instance.new("Frame")
+glow.Name = "PurpleGlow"
+glow.Size = UDim2.fromOffset(230, 150)
+glow.Position = UDim2.new(1, -120, 0, -80)
+glow.BackgroundColor3 = COLORS.Purple
+glow.BackgroundTransparency = 0.77
+glow.BorderSizePixel = 0
+glow.Parent = mainFrame
+
+createCorner(glow, 100)
+
+--// Header
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 82)
+header.BackgroundTransparency = 1
+header.Active = true
+header.Parent = mainFrame
+
+local logo = Instance.new("TextLabel")
+logo.Name = "Logo"
+logo.Size = UDim2.fromOffset(44, 44)
+logo.Position = UDim2.fromOffset(18, 17)
+logo.BackgroundColor3 = COLORS.Purple
+logo.BackgroundTransparency = 0.1
+logo.BorderSizePixel = 0
+logo.Text = "D"
+logo.Font = FONT
+logo.TextSize = 24
+logo.TextColor3 = COLORS.White
+logo.Parent = header
+
+createCorner(logo, 13)
+
+local logoGradient = Instance.new("UIGradient")
+logoGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, COLORS.PurpleLight),
+    ColorSequenceKeypoint.new(1, COLORS.PurpleDark)
+})
+
+logoGradient.Rotation = 45
+logoGradient.Parent = logo
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Name = "Title"
+titleLabel.Size = UDim2.new(1, -125, 0, 28)
+titleLabel.Position = UDim2.fromOffset(74, 14)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "DIPLEX HUB - AUTO TRAIT FARM"
+titleLabel.Font = FONT
+titleLabel.TextSize = 18
+titleLabel.TextColor3 = COLORS.White
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+titleLabel.Parent = header
+
+local discordLabel = Instance.new("TextLabel")
+discordLabel.Name = "Discord"
+discordLabel.Size = UDim2.new(1, -125, 0, 22)
+discordLabel.Position = UDim2.fromOffset(74, 42)
+discordLabel.BackgroundTransparency = 1
+discordLabel.Text = "discord.gg/freescript1"
+discordLabel.Font = FONT
+discordLabel.TextSize = 12
+discordLabel.TextColor3 = COLORS.PurpleLight
+discordLabel.TextXAlignment = Enum.TextXAlignment.Left
+discordLabel.Parent = header
+
+--// Close button
+local closeButton = Instance.new("TextButton")
+closeButton.Name = "Close"
+closeButton.Size = UDim2.fromOffset(34, 34)
+closeButton.Position = UDim2.new(1, -50, 0, 20)
+closeButton.BackgroundColor3 = COLORS.SurfaceLight
+closeButton.BackgroundTransparency = 0.2
+closeButton.BorderSizePixel = 0
+closeButton.Text = "X"
+closeButton.Font = FONT
+closeButton.TextSize = 15
+closeButton.TextColor3 = COLORS.Muted
+closeButton.AutoButtonColor = false
+closeButton.Parent = header
+
+createCorner(closeButton, 10)
+createStroke(closeButton, COLORS.Purple, 0.72, 1)
+
+connect(closeButton.MouseEnter, function()
+    tween(closeButton, 0.18, {
+        BackgroundColor3 = COLORS.Red,
+        TextColor3 = COLORS.White
+    })
+end)
+
+connect(closeButton.MouseLeave, function()
+    tween(closeButton, 0.18, {
+        BackgroundColor3 = COLORS.SurfaceLight,
+        TextColor3 = COLORS.Muted
+    })
+end)
+
+--// Header divider
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -36, 0, 1)
+divider.Position = UDim2.fromOffset(18, 81)
+divider.BackgroundColor3 = COLORS.Purple
+divider.BackgroundTransparency = 0.65
+divider.BorderSizePixel = 0
+divider.Parent = mainFrame
+
+--// Content
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -36, 0, 204)
+content.Position = UDim2.fromOffset(18, 96)
+content.BackgroundTransparency = 1
+content.Parent = mainFrame
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.Padding = UDim.new(0, 10)
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Parent = content
+
+--// Status bar
+local statusBar = Instance.new("Frame")
+statusBar.Name = "StatusBar"
+statusBar.Size = UDim2.new(1, -36, 0, 34)
+statusBar.Position = UDim2.new(0, 18, 1, -44)
+statusBar.BackgroundColor3 = COLORS.Surface
+statusBar.BackgroundTransparency = 0.18
+statusBar.BorderSizePixel = 0
+statusBar.Parent = mainFrame
+
+createCorner(statusBar, 10)
+createStroke(statusBar, COLORS.Purple, 0.72, 1)
+
+local statusDot = Instance.new("Frame")
+statusDot.Name = "Dot"
+statusDot.AnchorPoint = Vector2.new(0, 0.5)
+statusDot.Size = UDim2.fromOffset(9, 9)
+statusDot.Position = UDim2.new(0, 13, 0.5, 0)
+statusDot.BackgroundColor3 = COLORS.Muted
+statusDot.BorderSizePixel = 0
+statusDot.Parent = statusBar
+
+createCorner(statusDot, 10)
+
+local statusText = Instance.new("TextLabel")
+statusText.Name = "Status"
+statusText.Size = UDim2.new(1, -42, 1, 0)
+statusText.Position = UDim2.fromOffset(31, 0)
+statusText.BackgroundTransparency = 1
+statusText.Text = "AUTO BUY DISABLED"
+statusText.Font = FONT
+statusText.TextSize = 11
+statusText.TextColor3 = COLORS.Muted
+statusText.TextXAlignment = Enum.TextXAlignment.Left
+statusText.TextTruncate = Enum.TextTruncate.AtEnd
+statusText.Parent = statusBar
+
+local function setStatus(message, color)
+    if interfaceClosed then
+        return
+    end
+
+    if statusText.Text == string.upper(message) and statusText.TextColor3 == color then return end
+    statusText.Text = string.upper(message)
+    statusText.TextColor3 = color
+    statusDot.BackgroundColor3 = color
+
+    statusDot.Size = UDim2.fromOffset(13, 13)
+
+    tween(statusDot, 0.25, {
+        Size = UDim2.fromOffset(9, 9)
+    })
+end
+
+--// Toggle constructor
+local function createToggle(title, description, layoutOrder, callback)
+    local row = Instance.new("TextButton")
+    row.Name = title:gsub("%s+", "")
+    row.LayoutOrder = layoutOrder
+    row.Size = UDim2.new(1, 0, 0, 64)
+    row.BackgroundColor3 = COLORS.Surface
+    row.BackgroundTransparency = 0.14
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.Parent = content
+
+    createCorner(row, 14)
+
+    local rowStroke = createStroke(
+        row,
+        COLORS.Purple,
+        0.82,
+        1
+    )
+
+    local icon = Instance.new("Frame")
+    icon.Size = UDim2.fromOffset(38, 38)
+    icon.Position = UDim2.new(0, 13, 0.5, -19)
+    icon.BackgroundColor3 = COLORS.PurpleDark
+    icon.BackgroundTransparency = 0.2
+    icon.BorderSizePixel = 0
+    icon.Parent = row
+
+    createCorner(icon, 11)
+
+    local iconText = Instance.new("TextLabel")
+    iconText.Size = UDim2.fromScale(1, 1)
+    iconText.BackgroundTransparency = 1
+    iconText.Text = title == "Auto Buy" and "$" or "A"
+    iconText.Font = FONT
+    iconText.TextSize = 18
+    iconText.TextColor3 = COLORS.PurpleLight
+    iconText.Parent = icon
+
+    local titleText = Instance.new("TextLabel")
+    titleText.Size = UDim2.new(1, -132, 0, 24)
+    titleText.Position = UDim2.fromOffset(62, 10)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = title
+    titleText.Font = FONT
+    titleText.TextSize = 15
+    titleText.TextColor3 = COLORS.White
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Parent = row
+
+    local descriptionText = Instance.new("TextLabel")
+    descriptionText.Size = UDim2.new(1, -132, 0, 18)
+    descriptionText.Position = UDim2.fromOffset(62, 34)
+    descriptionText.BackgroundTransparency = 1
+    descriptionText.Text = description
+    descriptionText.Font = FONT
+    descriptionText.TextSize = 10
+    descriptionText.TextColor3 = COLORS.Muted
+    descriptionText.TextXAlignment = Enum.TextXAlignment.Left
+    descriptionText.TextTruncate = Enum.TextTruncate.AtEnd
+    descriptionText.Parent = row
+
+    local switch = Instance.new("Frame")
+    switch.Name = "Switch"
+    switch.Size = UDim2.fromOffset(50, 27)
+    switch.Position = UDim2.new(1, -65, 0.5, -13)
+    switch.BackgroundColor3 = Color3.fromRGB(63, 53, 76)
+    switch.BorderSizePixel = 0
+    switch.Parent = row
+
+    createCorner(switch, 20)
+
+    local knob = Instance.new("Frame")
+    knob.Name = "Knob"
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Size = UDim2.fromOffset(21, 21)
+    knob.Position = UDim2.new(0, 3, 0.5, 0)
+    knob.BackgroundColor3 = COLORS.Muted
+    knob.BorderSizePixel = 0
+    knob.Parent = switch
+
+    createCorner(knob, 20)
+
+    local enabled = false
+
+    local function updateToggle()
+        tween(switch, 0.28, {
+            BackgroundColor3 = enabled
+                and COLORS.Purple
+                or Color3.fromRGB(63, 53, 76)
+        })
+
+        tween(knob, 0.28, {
+            Position = enabled
+                and UDim2.new(1, -24, 0.5, 0)
+                or UDim2.new(0, 3, 0.5, 0),
+
+            BackgroundColor3 = enabled
+                and COLORS.White
+                or COLORS.Muted
+        })
+
+        tween(icon, 0.25, {
+            BackgroundColor3 = enabled
+                and COLORS.Purple
+                or COLORS.PurpleDark
+        })
+
+        tween(rowStroke, 0.25, {
+            Transparency = enabled and 0.3 or 0.82
+        })
+    end
+
+    connect(row.MouseEnter, function()
+        tween(row, 0.18, {
+            BackgroundTransparency = 0.02
+        })
+    end)
+
+    connect(row.MouseLeave, function()
+        tween(row, 0.18, {
+            BackgroundTransparency = 0.14
+        })
+    end)
+
+    connect(row.Activated, function()
+        enabled = not enabled
+        updateToggle()
+        callback(enabled)
+    end)
+
+    return row
+end
+
+--// Character handling
+local function updateCharacter(newCharacter)
+    cancelActivation()
+    restoreAnchors()
+    character = newCharacter
+    humanoidRootPart = nil
+
+    task.spawn(function()
+        local root = newCharacter:WaitForChild(
+            "HumanoidRootPart",
+            10
+        )
+
+        if not root or interfaceClosed or character ~= newCharacter then
+            return
+        end
+
+        humanoidRootPart = root
+
+        if isAnchored then
+            anchorOriginal[root] = root.Anchored
+            root.Anchored = true
+        end
+    end)
+end
+
+connect(player.CharacterAdded, updateCharacter)
+
+--// Anchor toggle
+createToggle(
+    "Anchor Character",
+    "Keeps your character in its current position",
+    1,
+
+    function(state)
+        isAnchored = state
+
+        local root = humanoidRootPart
+            or (
+                character
+                and character:FindFirstChild("HumanoidRootPart")
+            )
+
+        if root then
+            if state then
+                if anchorOriginal[root] == nil then anchorOriginal[root] = root.Anchored end
+                root.Anchored = true
+            else
+                restoreAnchors()
+            end
+        end
+    end
+)
+
+--// Auto Buy toggle
+createToggle(
+    "Auto Buy",
+    "Reliable scan for purchase prompts within 75 studs",
+    2,
+
+    function(state)
+        cancelActivation()
+        autoBuyEnabled = state
+
+        if state then
+            setStatus(
+                "Scanning within " .. AUTO_BUY_RANGE .. " studs",
+                COLORS.Green
+            )
+        else
+            restoreAllPrompts()
+
+            setStatus(
+                "Auto Buy disabled",
+                COLORS.Muted
+            )
+        end
+    end
+)
+
+--// UI size control. Viewport fitting is applied on top of the selected size.
+local requestedScale = 1
+local refreshScale = function() end
+local sizeRow = Instance.new("Frame")
+sizeRow.Name = "UISize"
+sizeRow.LayoutOrder = 3
+sizeRow.Size = UDim2.new(1, 0, 0, 48)
+sizeRow.BackgroundColor3 = COLORS.Surface
+sizeRow.BackgroundTransparency = 0.14
+sizeRow.BorderSizePixel = 0
+sizeRow.Parent = content
+createCorner(sizeRow, 12)
+
+local sizeTitle = Instance.new("TextLabel")
+sizeTitle.BackgroundTransparency = 1
+sizeTitle.Position = UDim2.fromOffset(13, 3)
+sizeTitle.Size = UDim2.new(1, -26, 0, 19)
+sizeTitle.Text = "UI SCALE 100%"
+sizeTitle.TextColor3 = COLORS.White
+sizeTitle.Font = FONT
+sizeTitle.TextSize = 13
+sizeTitle.TextXAlignment = Enum.TextXAlignment.Left
+sizeTitle.Parent = sizeRow
+
+local sizeTrack = Instance.new("TextButton")
+sizeTrack.Name = "ScaleSlider"
+sizeTrack.Position = UDim2.new(0, 15, 0, 31)
+sizeTrack.Size = UDim2.new(1, -30, 0, 7)
+sizeTrack.BackgroundColor3 = COLORS.SurfaceLight
+sizeTrack.BorderSizePixel = 0
+sizeTrack.Text = ""
+sizeTrack.AutoButtonColor = false
+sizeTrack.Parent = sizeRow
+createCorner(sizeTrack, 7)
+
+local sizeFill = Instance.new("Frame")
+sizeFill.Size = UDim2.fromScale(0.5, 1)
+sizeFill.BackgroundColor3 = COLORS.Purple
+sizeFill.BorderSizePixel = 0
+sizeFill.Parent = sizeTrack
+createCorner(sizeFill, 7)
+
+local sizeKnob = Instance.new("Frame")
+sizeKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+sizeKnob.Size = UDim2.fromOffset(16, 16)
+sizeKnob.Position = UDim2.fromScale(0.5, 0.5)
+sizeKnob.BackgroundColor3 = COLORS.White
+sizeKnob.BorderSizePixel = 0
+sizeKnob.Parent = sizeTrack
+createCorner(sizeKnob, 8)
+
+local sliding = false
+local slideInput = nil
+local function setScaleFromX(x)
+    local width = sizeTrack.AbsoluteSize.X
+    if width <= 0 then return end
+    local fraction = math.clamp((x - sizeTrack.AbsolutePosition.X) / width, 0, 1)
+    requestedScale = 0.65 + fraction * 0.7
+    sizeTitle.Text = string.format("UI SCALE %d%%", math.floor(requestedScale * 100 + 0.5))
+    sizeFill.Size = UDim2.fromScale(fraction, 1)
+    sizeKnob.Position = UDim2.fromScale(fraction, 0.5)
+    refreshScale()
+end
+connect(sizeTrack.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        sliding = true
+        slideInput = input
+        setScaleFromX(input.Position.X)
+    end
+end)
+connect(UserInputService.InputChanged, function(input)
+    if not sliding then return end
+    if (slideInput.UserInputType == Enum.UserInputType.Touch and input == slideInput)
+        or (slideInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement) then
+        setScaleFromX(input.Position.X)
+    end
+end)
+connect(UserInputService.InputEnded, function(input)
+    if input == slideInput then
+        sliding = false
+        slideInput = nil
+    end
+end)
+
+--// Purchase prompt detection
+local function cleanPromptText(value)
+    return trim(tostring(value or ""):gsub("<[^>]*>", "")
+        :gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("%s+", " "))
+end
+
+local function purchaseVerb(text)
+    local lower = string.lower(cleanPromptText(text))
+    return lower:match("^purchase%f[%W]") ~= nil
+        or lower:match("^buy%f[%W]") ~= nil
+end
+
+local function isPurchasePrompt(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return false end
+    -- ActionText is authoritative when it names a different operation.
+    local action = cleanPromptText(prompt.ActionText)
+    if purchaseVerb(action) then return true end
+    if action ~= "" then return false end
+    return purchaseVerb(prompt.Name) or purchaseVerb(prompt.ObjectText)
+end
+
+local function getPurchaseName(prompt)
+    local object = cleanPromptText(prompt.ObjectText)
+    if object ~= "" and not purchaseVerb(object) then return object end
+    for _, value in ipairs({prompt.ActionText, prompt.ObjectText, prompt.Name}) do
+        local text = cleanPromptText(value)
+        if purchaseVerb(text) then
+            local name = trim(text:gsub("^%a+", ""):gsub("^%s*[:%-]%s*", ""))
+            name = name:gsub("^%[", ""):gsub("%]$", "")
+            if name ~= "" then return name end
+        end
+    end
+    local model = prompt:FindFirstAncestorWhichIsA("Model")
+    return model and model.Name or "Brainrot"
+end
+
+--// Prompt position and range helpers
+local function getPromptWorldPosition(prompt)
+    if not prompt or not prompt.Parent then
+        return nil
+    end
+
+    local holder = prompt.Parent
+
+    if holder:IsA("Attachment") then
+        return holder.WorldPosition
+    end
+
+    if holder:IsA("BasePart") then
+        return holder.Position
+    end
+
+    if holder:IsA("Model") then
+        return holder:GetPivot().Position
+    end
+
+    local attachment = holder:FindFirstAncestorWhichIsA("Attachment")
+
+    if attachment then
+        return attachment.WorldPosition
+    end
+
+    local part = holder:FindFirstAncestorWhichIsA("BasePart")
+
+    if part then
+        return part.Position
+    end
+
+    local model = holder:FindFirstAncestorWhichIsA("Model")
+
+    if model then
+        return model:GetPivot().Position
+    end
+
+    return nil
+end
+
+local function getRootPart()
+    local root = humanoidRootPart
+
+    if root and root.Parent then
+        return root
+    end
+
+    if character then
+        root = character:FindFirstChild("HumanoidRootPart")
+    end
+
+    humanoidRootPart = root
+    return root
+end
+
+local function getPromptDistance(prompt)
+    local root = getRootPart()
+    local promptPosition = getPromptWorldPosition(prompt)
+
+    if not root or not promptPosition then
+        return math.huge
+    end
+
+    return (root.Position - promptPosition).Magnitude
+end
+
+local function isPromptInRange(prompt)
+    return getPromptDistance(prompt)
+        <= (AUTO_BUY_RANGE + DISTANCE_TOLERANCE)
+end
+
+local function improvePromptRange(prompt)
+    if not prompt or not prompt.Parent then
+        return
+    end
+
+    if not originalPromptSettings[prompt] then
+        originalPromptSettings[prompt] = {
+            MaxActivationDistance = prompt.MaxActivationDistance,
+            RequiresLineOfSight = prompt.RequiresLineOfSight
+        }
+    end
+
+    if prompt.MaxActivationDistance < AUTO_BUY_RANGE then
+        prompt.MaxActivationDistance = AUTO_BUY_RANGE
+    end
+
+    if prompt.RequiresLineOfSight then
+        prompt.RequiresLineOfSight = false
+    end
+end
+
+local function restorePrompt(prompt)
+    local original = originalPromptSettings[prompt]
+
+    if not original or not prompt or not prompt.Parent then
+        originalPromptSettings[prompt] = nil
+        return
+    end
+
+    prompt.MaxActivationDistance = original.MaxActivationDistance
+    prompt.RequiresLineOfSight = original.RequiresLineOfSight
+    originalPromptSettings[prompt] = nil
+end
+
+local function registerPrompt(instance)
+    if not instance or not instance:IsA("ProximityPrompt") then
+        return
+    end
+
+    -- Track every prompt because some games fill ActionText/ObjectText later.
+    trackedPrompts[instance] = true
+
+    if autoBuyEnabled and isPurchasePrompt(instance) then
+        improvePromptRange(instance)
+    end
+end
+
+local function registerExistingPrompts()
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        registerPrompt(instance)
+    end
+end
+
+restoreAllPrompts = function()
+    for prompt in pairs(originalPromptSettings) do
+        restorePrompt(prompt)
+    end
+end
+
+--// Serialized activation: never overlap holds or claim a confirmed purchase.
+local function activatePurchasePrompt(prompt)
+    if activePrompt or interfaceClosed or not autoBuyEnabled then return end
+    if (promptCooldowns[prompt] or 0) > os.clock() then return end
+    if not prompt:IsDescendantOf(workspace) or not prompt.Enabled
+        or not isPurchasePrompt(prompt) or not isPromptInRange(prompt) then return end
+    activePrompt = prompt
+    local token = generation
+    local root = getRootPart()
+    task.spawn(function()
+        local success, failure = pcall(function()
+            improvePromptRange(prompt)
+            setStatus("Trying " .. getPurchaseName(prompt), COLORS.PurpleLight)
+            prompt:InputHoldBegin()
+            local started = os.clock()
+            repeat
+                task.wait(0.03)
+                if interfaceClosed or not autoBuyEnabled or token ~= generation
+                    or root ~= getRootPart() or not prompt:IsDescendantOf(workspace)
+                    or not prompt.Enabled or not isPurchasePrompt(prompt)
+                    or not isPromptInRange(prompt) then return end
+            until os.clock() - started >= math.max(prompt.HoldDuration, 0.03) + 0.04
+        end)
+        pcall(function() prompt:InputHoldEnd() end)
+        if activePrompt == prompt then activePrompt = nil end
+        if prompt:IsDescendantOf(workspace) then
+            promptCooldowns[prompt] = os.clock() + (success and PROMPT_COOLDOWN or 2)
+        end
+        if not success and not interfaceClosed then
+            setStatus("Activation failed - retrying", COLORS.Red)
+            warn("[Trait Farm] " .. tostring(failure))
+        end
+    end)
+end
+
+connect(ProximityPromptService.PromptShown, function(prompt)
+    if not interfaceClosed then registerPrompt(prompt) end
+end)
+connect(workspace.DescendantAdded, function(instance)
+    if instance:IsA("ProximityPrompt") then registerPrompt(instance) end
+end)
+connect(workspace.DescendantRemoving, function(instance)
+    if not instance:IsA("ProximityPrompt") then return end
+    if activePrompt == instance then cancelActivation() end
+    restorePrompt(instance)
+    trackedPrompts[instance] = nil
+    promptCooldowns[instance] = nil
+end)
+
+-- Listeners attach before the initial scan so newly streamed prompts are caught.
+registerExistingPrompts()
+local scanAccumulator = 0
+connect(RunService.Heartbeat, function(deltaTime)
+    if interfaceClosed or not autoBuyEnabled then return end
+    scanAccumulator = scanAccumulator + deltaTime
+    if scanAccumulator < SCAN_INTERVAL then return end
+    scanAccumulator = 0
+    local nearestPrompt, nearestDistance = nil, math.huge
+    local detected, nearby = 0, 0
+    local now = os.clock()
+    for prompt in pairs(trackedPrompts) do
+        if not prompt:IsDescendantOf(workspace) then
+            restorePrompt(prompt)
+            trackedPrompts[prompt] = nil
+            promptCooldowns[prompt] = nil
+        elseif isPurchasePrompt(prompt) then
+            detected = detected + 1
+            if prompt.Enabled then
+                local distance = getPromptDistance(prompt)
+                if distance <= AUTO_BUY_RANGE + DISTANCE_TOLERANCE then
+                    nearby = nearby + 1
+                    if distance < nearestDistance and (promptCooldowns[prompt] or 0) <= now then
+                        nearestPrompt, nearestDistance = prompt, distance
+                    end
+                end
+            end
+        else
+            restorePrompt(prompt)
+        end
+        -- Disabled prompts stay tracked and are re-evaluated when enabled.
+    end
+    if not activePrompt then
+        setStatus(string.format("%d detected / %d nearby", detected, nearby), COLORS.Green)
+        if nearestPrompt then activatePurchasePrompt(nearestPrompt) end
+    end
+end)
+
+-- Fit the same interface on phones and respond to viewport changes.
+local mainScale = Instance.new("UIScale", mainFrame)
+local shadowScale = Instance.new("UIScale", shadow)
+local viewportConnection
+refreshScale = function()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    local fittingScale = math.min(
+        math.max(0.1, (viewport.X - 24) / 384),
+        math.max(0.1, (viewport.Y - 24) / 354))
+    local scale = math.min(requestedScale, fittingScale)
+    mainScale.Scale, shadowScale.Scale = scale, scale
+end
+local function bindViewport()
+    if viewportConnection then viewportConnection:Disconnect() end
+    local camera = workspace.CurrentCamera
+    refreshScale()
+    if camera then viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshScale) end
+end
+bindViewport()
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindViewport)
+
+--// Smooth dragging
+local dragging = false
+local dragInput = nil
+local dragStart = nil
+local frameStart = nil
+local targetPosition = mainFrame.Position
+
+connect(header.InputBegan, function(input)
+    local inputType = input.UserInputType
+
+    if inputType ~= Enum.UserInputType.MouseButton1
+        and inputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    dragging = true
+    dragStart = input.Position
+    frameStart = mainFrame.Position
+
+
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input == dragInput then
+        dragging = false
+    end
+end)
+
+connect(header.InputChanged, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if not dragging or input ~= dragInput then
+        return
+    end
+
+    local delta = input.Position - dragStart
+
+    targetPosition = UDim2.new(
+        frameStart.X.Scale,
+        frameStart.X.Offset + delta.X / mainScale.Scale,
+        frameStart.Y.Scale,
+        frameStart.Y.Offset + delta.Y / mainScale.Scale
+    )
+end)
+
+connect(RunService.RenderStepped, function(deltaTime)
+    if interfaceClosed then
+        return
+    end
+
+    local smoothness = math.clamp(
+        deltaTime * 22,
+        0,
+        1
+    )
+
+    mainFrame.Position = mainFrame.Position:Lerp(
+        targetPosition,
+        smoothness
+    )
+
+    shadow.Position = mainFrame.Position + UDim2.fromOffset(6, 8)
+end)
+
+--// Close logic
+connect(closeButton.Activated, function()
+    interfaceClosed = true
+    autoBuyEnabled = false
+    isAnchored = false
+
+    if restoreAllPrompts then
+        restoreAllPrompts()
+    end
+
+    cancelActivation()
+    restoreAnchors()
+
+    tween(mainFrame, 0.22, {
+        Size = UDim2.fromOffset(340, 250),
+        BackgroundTransparency = 1
+    })
+
+    tween(shadow, 0.22, {
+        BackgroundTransparency = 1
+    })
+
+    task.wait(0.22)
+    screenGui:Destroy()
+end)
+
+--// Disconnect events when destroyed
+screenGui.Destroying:Connect(function()
+    cancelActivation()
+    restoreAnchors()
+    if viewportConnection then viewportConnection:Disconnect() end
+    interfaceClosed = true
+    autoBuyEnabled = false
+
+    if restoreAllPrompts then
+        restoreAllPrompts()
+    end
+
+    for _, connection in ipairs(connections) do
+        if connection.Connected then
+            connection:Disconnect()
+        end
+    end
+
+    table.clear(connections)
+end)
+
+--// Opening animation
+local finalSize = mainFrame.Size
+
+mainFrame.Size = UDim2.fromOffset(330, 240)
+mainFrame.BackgroundTransparency = 1
+shadow.BackgroundTransparency = 1
+
+tween(mainFrame, 0.45, {
+    Size = finalSize,
+    BackgroundTransparency = 0.08
+})
+
+tween(shadow, 0.45, {
+    BackgroundTransparency = 0.45
+})
+
+tween(mainStroke, 0.65, {
+    Transparency = 0.25
+})
